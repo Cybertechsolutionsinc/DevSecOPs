@@ -1,0 +1,389 @@
+# -----------------------------------------------------------------------------
+# Reusable FULL security scan workflow
+#
+# Wraps Checkov + Trivy + Semgrep + Gitleaks + OSV-Scanner behind a single
+# workflow_call entrypoint so every product repo in the org consumes one
+# versioned workflow:
+#
+#   jobs:
+#     scan:
+#       uses: <your-org>/platform-workflows/.github/workflows/security-scan-reusable.yml@v1
+#       permissions:
+#         contents: read
+#         security-events: write
+#         pull-requests: write
+#       with:
+#         scan-path: .
+#         fail-severity: HIGH
+#
+# Publish this in your central `platform-workflows` repo, tag it `v1`, and
+# every downstream repo picks up updates on its next run.
+# -----------------------------------------------------------------------------
+name: Reusable Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      scan-path:
+        description: Path to scan (relative to repo root)
+        type: string
+        required: false
+        default: .
+      iac-frameworks:
+        description: Comma-separated Checkov frameworks
+        type: string
+        required: false
+        default: arm,bicep,terraform,kubernetes,dockerfile
+      fail-severity:
+        description: Minimum severity that fails the build (LOW|MEDIUM|HIGH|CRITICAL)
+        type: string
+        required: false
+        default: HIGH
+      soft-fail:
+        description: Report findings but never fail the build
+        type: boolean
+        required: false
+        default: false
+      run-iac:
+        description: Enable IaC scanning (Checkov + Trivy config)
+        type: boolean
+        required: false
+        default: true
+      run-sast:
+        description: Enable SAST (Semgrep)
+        type: boolean
+        required: false
+        default: true
+      run-secrets:
+        description: Enable secret scanning (Gitleaks)
+        type: boolean
+        required: false
+        default: true
+      run-deps:
+        description: Enable dependency / filesystem scan (Trivy + OSV)
+        type: boolean
+        required: false
+        default: true
+      upload-sarif:
+        description: Upload SARIF to GitHub code scanning
+        type: boolean
+        required: false
+        default: true
+      semgrep-config:
+        description: Space-separated Semgrep configs
+        type: string
+        required: false
+        default: p/security-audit p/secrets p/owasp-top-ten p/cwe-top-25
+      artifact-retention-days:
+        description: How long to keep SARIF artifacts
+        type: number
+        required: false
+        default: 30
+
+# Consumers must grant these in the caller workflow:
+#   permissions:
+#     contents: read
+#     security-events: write
+#     pull-requests: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  iac-scan:
+    if: ${{ inputs.run-iac }}
+    name: IaC (Checkov + Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bicep lint
+        shell: bash
+        run: |
+          if find "${{ inputs.scan-path }}" -name "*.bicep" | grep -q .; then
+            for f in $(find "${{ inputs.scan-path }}" -name "*.bicep"); do
+              echo "Linting $f"
+              az bicep build --file "$f" || exit 1
+            done
+          else
+            echo "No bicep files — skipping"
+          fi
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ inputs.scan-path }}
+          framework: ${{ inputs.iac-frameworks }}
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: true
+          download_external_modules: true
+
+      - name: Trivy config
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.scan-path }}
+          format: sarif
+          output: trivy-iac.sarif
+          severity: ${{ inputs.fail-severity }},CRITICAL
+          exit-code: '0'
+          ignore-unfixed: true
+
+      - name: Gate IaC findings
+        if: ${{ !inputs.soft-fail }}
+        shell: bash
+        env:
+          FAIL_SEVERITY: ${{ inputs.fail-severity }}
+        run: |
+          python3 <<'PY'
+          import json, os, pathlib, sys
+          thresholds = {"LOW": 0.1, "MEDIUM": 4.0, "HIGH": 7.0, "CRITICAL": 9.0}
+          cutoff = thresholds.get(os.environ["FAIL_SEVERITY"].upper(), 7.0)
+          total = 0
+          for f in ["checkov.sarif", "trivy-iac.sarif"]:
+              p = pathlib.Path(f)
+              if not p.exists():
+                  continue
+              data = json.loads(p.read_text())
+              for run in data.get("runs", []):
+                  rules = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+                  for res in run.get("results", []):
+                      rid = res.get("ruleId", "")
+                      sev = (rules.get(rid, {}).get("properties", {}) or {}).get("security-severity", "0")
+                      try:
+                          sev_num = float(sev)
+                      except Exception:
+                          sev_num = 0.0
+                      if res.get("level") == "error" or sev_num >= cutoff:
+                          total += 1
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"## IaC Scan\n\nFindings at or above **{os.environ['FAIL_SEVERITY']}**: **{total}**\n")
+          if total > 0:
+              print(f"::error::{total} IaC findings at or above {os.environ['FAIL_SEVERITY']}")
+              sys.exit(1)
+          PY
+
+      - name: Upload Checkov SARIF
+        if: always() && inputs.upload-sarif
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+      - name: Upload Trivy IaC SARIF
+        if: always() && inputs.upload-sarif
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-iac.sarif
+          category: trivy-iac
+
+      - name: Upload IaC artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iac-scan-results
+          path: |
+            checkov.sarif
+            trivy-iac.sarif
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+  # ---------------------------------------------------------------------------
+  sast:
+    if: ${{ inputs.run-sast }}
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Semgrep
+        run: |
+          configs=""
+          for c in ${{ inputs.semgrep-config }}; do
+            configs="$configs --config=$c"
+          done
+          semgrep scan $configs \
+            --sarif --output=semgrep.sarif \
+            --severity=ERROR --severity=WARNING || echo "Semgrep exit $? — gating below"
+        continue-on-error: true
+
+      - name: Gate SAST findings
+        if: ${{ !inputs.soft-fail }}
+        shell: sh
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, pathlib
+          p = pathlib.Path("semgrep.sarif")
+          if not p.exists():
+              sys.exit(0)
+          data = json.loads(p.read_text())
+          hi = sum(1 for run in data.get("runs", []) for res in run.get("results", []) if res.get("level") == "error")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"## SAST (Semgrep)\n\nHIGH/CRITICAL findings: **{hi}**\n")
+          if hi > 0:
+              print(f"::error::{hi} HIGH/CRITICAL Semgrep findings")
+              sys.exit(1)
+          PY
+
+      - name: Upload Semgrep SARIF
+        if: always() && inputs.upload-sarif
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload SAST artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-results
+          path: semgrep.sarif
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+  # ---------------------------------------------------------------------------
+  secrets:
+    if: ${{ inputs.run-secrets }}
+    name: Secrets (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITLEAKS_ENABLE_SUMMARY: true
+        continue-on-error: ${{ inputs.soft-fail }}
+
+  # ---------------------------------------------------------------------------
+  deps:
+    if: ${{ inputs.run-deps }}
+    name: Dependencies (Trivy + OSV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.scan-path }}
+          format: sarif
+          output: trivy-deps.sarif
+          severity: ${{ inputs.fail-severity }},CRITICAL
+          exit-code: ${{ inputs.soft-fail && '0' || '1' }}
+          ignore-unfixed: true
+          scanners: vuln,secret,misconfig
+
+      - name: OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v1.9.0
+        with:
+          scan-args: |-
+            --recursive
+            --skip-git
+            --format=sarif
+            --output=osv.sarif
+            ${{ inputs.scan-path }}
+        continue-on-error: true
+
+      - name: Gate OSV findings
+        if: ${{ !inputs.soft-fail }}
+        shell: bash
+        env:
+          FAIL_SEVERITY: ${{ inputs.fail-severity }}
+        run: |
+          python3 <<'PY'
+          import json, os, pathlib, sys
+          p = pathlib.Path("osv.sarif")
+          if not p.exists():
+              sys.exit(0)
+          thresholds = {"LOW": 0.1, "MEDIUM": 4.0, "HIGH": 7.0, "CRITICAL": 9.0}
+          cutoff = thresholds.get(os.environ["FAIL_SEVERITY"].upper(), 7.0)
+          data = json.loads(p.read_text())
+          hi = 0
+          for run in data.get("runs", []):
+              rules = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+              for res in run.get("results", []):
+                  rule = rules.get(res.get("ruleId", ""), {})
+                  sev = (rule.get("properties", {}) or {}).get("security-severity", "0")
+                  try:
+                      if float(sev) >= cutoff:
+                          hi += 1
+                  except Exception:
+                      pass
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"## Dependencies (OSV)\n\nFindings at or above **{os.environ['FAIL_SEVERITY']}**: **{hi}**\n")
+          if hi > 0:
+              print(f"::error::{hi} OSV findings at or above {os.environ['FAIL_SEVERITY']}")
+              sys.exit(1)
+          PY
+
+      - name: Upload Trivy deps SARIF
+        if: always() && inputs.upload-sarif
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-deps.sarif
+          category: trivy-deps
+
+      - name: Upload OSV SARIF
+        if: always() && inputs.upload-sarif && hashFiles('osv.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: osv.sarif
+          category: osv
+
+      - name: Upload deps artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deps-scan-results
+          path: |
+            trivy-deps.sarif
+            osv.sarif
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+  # ---------------------------------------------------------------------------
+  pr-summary:
+    name: PR Summary
+    needs: [iac-scan, sast, secrets, deps]
+    if: github.event_name == 'pull_request' && always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-artifacts
+
+      - name: Build comment
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json, pathlib, os
+          artifacts = pathlib.Path("scan-artifacts")
+          sections = []
+          for sarif in artifacts.rglob("*.sarif"):
+              try:
+                  data = json.loads(sarif.read_text())
+              except Exception:
+                  continue
+              counts = {"error": 0, "warning": 0, "note": 0}
+              for run in data.get("runs", []):
+                  for res in run.get("results", []):
+                      lvl = res.get("level", "warning")
+                      counts[lvl] = counts.get(lvl, 0) + 1
+              sections.append(f"| {sarif.stem} | {counts['error']} | {counts['warning']} | {counts['note']} |")
+          body = ["## Security Scan Summary", "",
+                  "| Scanner | Errors | Warnings | Notes |",
+                  "|---|---:|---:|---:|"] + sections + [""]
+          body.append(f"Details: [workflow run]({os.environ.get('GITHUB_SERVER_URL','')}/{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/{os.environ.get('GITHUB_RUN_ID','')}).")
+          pathlib.Path("comment.md").write_text("\n".join(body))
+          PY
+
+      - name: Post PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: security-scan
+          path: comment.md
