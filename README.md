@@ -27,12 +27,12 @@ Copy `security-scan.yml` and `.gitleaks.toml` into the repo. One file, five scan
 
 ### Org-wide (recommended)
 
-Host the `*-reusable.yml` files and the orchestrator in a central `platform-workflows` repo, tag `v1`, and have every product repo call the orchestrator with three lines:
+Host the `*-reusable.yml` files and the orchestrator in a central `DevSecOps` repo, tag `v1`, and have every product repo call the orchestrator with three lines:
 
 ```yaml
 jobs:
   scan:
-    uses: your-org/platform-workflows/.github/workflows/security-scan-reusable.yml@v1
+    uses: your-org/DevSecOps/.github/workflows/security-scan-reusable.yml@v1
     permissions:
       contents: read
       security-events: write
@@ -47,12 +47,12 @@ Teams that want finer control — for example, a Terraform-only repo that doesn'
 ```yaml
 jobs:
   checkov:
-    uses: your-org/platform-workflows/.github/workflows/checkov-reusable.yml@v1
+    uses: your-org/DevSecOps/.github/workflows/checkov-reusable.yml@v1
     permissions: { contents: read, security-events: write }
     with: { frameworks: terraform, fail-severity: HIGH }
 
   gitleaks:
-    uses: your-org/platform-workflows/.github/workflows/gitleaks-reusable.yml@v1
+    uses: your-org/DevSecOps/.github/workflows/gitleaks-reusable.yml@v1
     permissions: { contents: read }
 ```
 
@@ -91,7 +91,7 @@ permissions:
 
 ## Versioning
 
-Publish the reusable workflows in your `platform-workflows` repo and tag:
+Publish the reusable workflows in your `DevSecOps` repo and tag:
 
 ```bash
 git tag -a v1.0.0 -m "v1.0.0 initial release"
@@ -113,7 +113,7 @@ Always document *why* a rule is suppressed in a nearby comment.
 
 ## Rollout checklist
 
-1. Publish `platform-workflows` repo with all `*-reusable.yml` files, tag `v1`
+1. Publish `DevSecOps` repo with all `*-reusable.yml` files, tag `v1`
 2. Pilot on 3–5 volunteer repos in `soft-fail: true` mode for one sprint
 3. Triage the baseline — fix critical, suppress acceptable, document decisions
 4. Flip `soft-fail: false` + add the scan as a required status check on `main`
